@@ -140,6 +140,16 @@ case "$MODE" in
         send_role_output 1493722988732874763 "Reviewer Output" "$OUTPUT" || exit 1
         ;;
 
+    verifier)
+        notify "Dispatching \$verifier via OmX (gpt-5.4-mini, evidence-backed verification)..."
+        clean_omx_state
+        OUTPUT=$(cd "$WORKDIR" && omx exec --dangerously-bypass-approvals-and-sandbox --ephemeral \
+            "You are Verifier. Prove or disprove the following claim with concrete evidence — run commands, read files, check diffs. Your response MUST end with a single verdict line: Verdict: PASS or Verdict: FAIL or Verdict: PARTIAL — this line is machine-parsed. Claim to verify: $TASK" 2>&1 | tail -400)
+        echo "$OUTPUT"
+        # Verifier shares the #reviewer channel per Sigrid plan
+        send_role_output 1493722988732874763 "Verifier Output" "$OUTPUT" || exit 1
+        ;;
+
     claw)
         notify "Dispatching to claw-code (Claude)..."
         OUTPUT=$(cd "$WORKDIR" && ./rust/target/debug/claw prompt "$TASK" 2>&1 | tail -400)
@@ -166,7 +176,7 @@ $OUTPUT"
         # leading "then", leading comma/whitespace, and optional whitespace
         # between the $ and the role name (e.g. "$ reviewer"). The | is safe
         # because it can't appear inside a Discord command for shell reasons.
-        NORMALIZED=$(echo "$CLEANED" | sed -E 's/[[:space:],]*then[[:space:]]+\$[[:space:]]*(architect|executor|reviewer)\b/|$\1/g; s/[[:space:]]+\$[[:space:]]*(architect|executor|reviewer)\b/|$\1/g')
+        NORMALIZED=$(echo "$CLEANED" | sed -E 's/[[:space:],]*then[[:space:]]+\$[[:space:]]*(architect|executor|reviewer|verifier)\b/|$\1/g; s/[[:space:]]+\$[[:space:]]*(architect|executor|reviewer|verifier)\b/|$\1/g')
         # Strip leading | if the task starts with a $role
         NORMALIZED="${NORMALIZED#|}"
 
@@ -183,7 +193,7 @@ $OUTPUT"
             SUBTASK=$(echo "$seg" | cut -d' ' -f2-)
 
             case "$ROLE" in
-                architect|executor|reviewer)
+                architect|executor|reviewer|verifier)
                     STEP_COUNT=$((STEP_COUNT + 1))
                     notify "→ Step $STEP_COUNT: dispatching \$$ROLE"
                     if ! "$0" "$ROLE" "$SUBTASK" "$CHANNEL"; then
@@ -224,7 +234,7 @@ $OUTPUT"
         ;;
 
     *)
-        echo "Usage: discord-dispatch.sh <team|architect|executor|reviewer|arch-omx|exec-omx|review-omx|pipeline|pipeline-omx|claw|ultrawork> <task> [channel_id]"
+        echo "Usage: discord-dispatch.sh <team|architect|executor|reviewer|verifier|arch-omx|exec-omx|review-omx|pipeline|pipeline-omx|claw|ultrawork> <task> [channel_id]"
         exit 1
         ;;
 esac
