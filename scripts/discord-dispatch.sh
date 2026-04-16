@@ -28,6 +28,21 @@ clean_omx_state() {
     rm -f "$WORKDIR/.omx/state/dispatch.json" 2>/dev/null
 }
 
+# Emit clawhip agent lifecycle events for event-stream routing.
+# Uses agent_name field which routes to per-role Discord channels.
+SESSION_ID="dispatch-$(date +%s)"
+
+agent_started() {
+    clawhip agent started --name "$1" --session "$SESSION_ID" --summary "Dispatched via discord-dispatch.sh" 2>/dev/null || true
+}
+
+agent_finished() {
+    local ROLE="$1" ELAPSED="$2" SUMMARY="$3"
+    clawhip agent finished --name "$ROLE" --session "$SESSION_ID" \
+        ${ELAPSED:+--elapsed "$ELAPSED"} \
+        ${SUMMARY:+--summary "$SUMMARY"} 2>/dev/null || true
+}
+
 # Send long agent output to a role channel. Discord caps messages at 2000 chars,
 # so truncate with a marker. Full output still goes to stdout for programmatic
 # callers. Returns non-zero if the clawhip send fails, so callers (including
@@ -79,6 +94,8 @@ case "$MODE" in
 
     architect)
         ARCHITECT_MODE="${ARCHITECT_MODE:-opencode}"
+        agent_started architect
+        START_TIME=$SECONDS
         if [ "$ARCHITECT_MODE" = "omx" ]; then
             notify "Dispatching \$architect via OmX (gpt-5.4, read-only analysis)..."
             clean_omx_state
@@ -89,12 +106,16 @@ case "$MODE" in
             OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
                 "You MUST delegate the following task to the Architect sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
         fi
+        ELAPSED=$((SECONDS - START_TIME))
         echo "$OUTPUT"
         send_role_output 1493722920491552889 "Architect Output" "$OUTPUT" || exit 1
+        agent_finished architect "$ELAPSED" "Analysis complete"
         ;;
 
     executor)
         EXECUTOR_MODE="${EXECUTOR_MODE:-opencode}"
+        agent_started executor
+        START_TIME=$SECONDS
         if [ "$EXECUTOR_MODE" = "omx" ]; then
             notify "Dispatching \$executor via OmX (gpt-5.4, Lore commits enabled)..."
             clean_omx_state
@@ -105,8 +126,10 @@ case "$MODE" in
             OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
                 "You MUST delegate the following task to the Executor sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
         fi
+        ELAPSED=$((SECONDS - START_TIME))
         echo "$OUTPUT"
         send_role_output 1493722957992689744 "Executor Output" "$OUTPUT" || exit 1
+        agent_finished executor "$ELAPSED" "Implementation complete"
         ;;
 
     arch-omx)
@@ -126,6 +149,8 @@ case "$MODE" in
 
     reviewer)
         REVIEWER_MODE="${REVIEWER_MODE:-opencode}"
+        agent_started code-reviewer
+        START_TIME=$SECONDS
         if [ "$REVIEWER_MODE" = "omx" ]; then
             notify "Dispatching \$reviewer via OmX (gpt-5.4, two-stage review)..."
             clean_omx_state
@@ -136,18 +161,24 @@ case "$MODE" in
             OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
                 "You MUST delegate the following task to the Code Reviewer sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
         fi
+        ELAPSED=$((SECONDS - START_TIME))
         echo "$OUTPUT"
         send_role_output 1493722988732874763 "Reviewer Output" "$OUTPUT" || exit 1
+        agent_finished code-reviewer "$ELAPSED" "Review complete"
         ;;
 
     verifier)
+        agent_started verifier
+        START_TIME=$SECONDS
         notify "Dispatching \$verifier via OmX (gpt-5.4-mini, evidence-backed verification)..."
         clean_omx_state
         OUTPUT=$(cd "$WORKDIR" && omx exec --dangerously-bypass-approvals-and-sandbox --ephemeral \
             "You are Verifier. Prove or disprove the following claim with concrete evidence — run commands, read files, check diffs. Your response MUST end with a single verdict line: Verdict: PASS or Verdict: FAIL or Verdict: PARTIAL — this line is machine-parsed. Claim to verify: $TASK" 2>&1 | tail -400)
+        ELAPSED=$((SECONDS - START_TIME))
         echo "$OUTPUT"
         # Verifier shares the #reviewer channel per Sigrid plan
         send_role_output 1493722988732874763 "Verifier Output" "$OUTPUT" || exit 1
+        agent_finished verifier "$ELAPSED" "Verification complete"
         ;;
 
     claw)
