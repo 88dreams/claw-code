@@ -222,6 +222,87 @@ $OUTPUT"
         exec "$0" pipeline "$TASK" "$CHANNEL"
         ;;
 
+    ralph)
+        # Controlled loop: Architect → Executor → Verifier → Reviewer → gate.
+        # If reviewer says APPROVE: done. If REQUEST CHANGES: loop back to
+        # executor with reviewer feedback. Bounded by MAX_ITERATIONS.
+        # All roles forced through OmX for structured verdicts.
+        export ARCHITECT_MODE=omx EXECUTOR_MODE=omx REVIEWER_MODE=omx
+
+        MAX_ITERATIONS="${RALPH_MAX_ITERATIONS:-3}"
+        ITERATION=0
+        ARCHITECT_OUTPUT=""
+        REVIEWER_FEEDBACK=""
+
+        notify "🔁 Ralph mode: starting controlled loop (max $MAX_ITERATIONS iterations)..."
+
+        while [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; do
+            ITERATION=$((ITERATION + 1))
+            notify "━━━ Iteration $ITERATION / $MAX_ITERATIONS ━━━"
+
+            # Step 1: Architect (only on first iteration — analysis doesn't change)
+            if [ "$ITERATION" -eq 1 ]; then
+                notify "→ [$ITERATION] Step 1: \$architect analyzing..."
+                ARCHITECT_OUTPUT=$("$0" architect "$TASK" "$CHANNEL" 2>&1)
+            else
+                notify "→ [$ITERATION] Skipping architect (reusing iteration 1 analysis)"
+            fi
+
+            # Step 2: Executor — on iteration 1 uses architect guidance,
+            # on subsequent iterations includes reviewer feedback
+            if [ "$ITERATION" -eq 1 ]; then
+                EXECUTOR_TASK="$TASK"
+            else
+                EXECUTOR_TASK="REVIEWER FEEDBACK FROM PREVIOUS ITERATION: $REVIEWER_FEEDBACK --- ORIGINAL TASK: $TASK --- Fix the issues identified by the reviewer and try again."
+            fi
+            notify "→ [$ITERATION] Step 2: \$executor implementing..."
+            EXECUTOR_OUTPUT=$("$0" executor "$EXECUTOR_TASK" "$CHANNEL" 2>&1)
+
+            # Step 3: Verifier — check executor's claims
+            VERIFIER_TASK="Verify that the executor completed the following task correctly: $TASK"
+            notify "→ [$ITERATION] Step 3: \$verifier checking claims..."
+            VERIFIER_OUTPUT=$("$0" verifier "$VERIFIER_TASK" "$CHANNEL" 2>&1)
+
+            # Step 4: Reviewer — final judgment
+            REVIEWER_TASK="Review the changes made for: $TASK"
+            notify "→ [$ITERATION] Step 4: \$reviewer judging..."
+            REVIEWER_OUTPUT=$("$0" reviewer "$REVIEWER_TASK" "$CHANNEL" 2>&1)
+
+            # Extract verdict — must be tightly anchored to avoid false matches
+            # (e.g., "the word APPROVE appears in a comment" shouldn't match)
+            VERDICT=$(echo "$REVIEWER_OUTPUT" | grep -oP '^Verdict:\s*\K.*' | tail -1)
+            # Fallback: try non-anchored if structured output has leading whitespace
+            if [ -z "$VERDICT" ]; then
+                VERDICT=$(echo "$REVIEWER_OUTPUT" | grep -oP 'Verdict:\s*\K(APPROVE|REQUEST CHANGES|COMMENT)' | tail -1)
+            fi
+
+            case "$VERDICT" in
+                APPROVE)
+                    notify "✅ Ralph loop APPROVED at iteration $ITERATION / $MAX_ITERATIONS"
+                    echo "ralph_result=approved ralph_iterations=$ITERATION"
+                    exit 0
+                    ;;
+                REQUEST*CHANGES|REQUEST\ CHANGES)
+                    if [ "$ITERATION" -lt "$MAX_ITERATIONS" ]; then
+                        # Extract reviewer feedback for next executor iteration
+                        REVIEWER_FEEDBACK=$(echo "$REVIEWER_OUTPUT" | grep -v "^Verdict:" | tail -20)
+                        notify "🔄 Iteration $ITERATION: REQUEST CHANGES — looping back to executor"
+                    fi
+                    ;;
+                *)
+                    notify "⚠️ Iteration $ITERATION: ambiguous or missing verdict ('$VERDICT') — breaking loop"
+                    echo "ralph_result=ambiguous ralph_iterations=$ITERATION ralph_verdict=$VERDICT"
+                    exit 1
+                    ;;
+            esac
+        done
+
+        # Hit iteration cap
+        notify "🛑 Ralph loop hit iteration cap ($MAX_ITERATIONS) without APPROVE — manual review needed"
+        echo "ralph_result=cap_reached ralph_iterations=$MAX_ITERATIONS"
+        exit 1
+        ;;
+
     ultrawork)
         SESSION_NAME="ulw-$(date +%s)"
         notify "Spawning ultrawork session: $SESSION_NAME"
@@ -234,7 +315,7 @@ $OUTPUT"
         ;;
 
     *)
-        echo "Usage: discord-dispatch.sh <team|architect|executor|reviewer|verifier|arch-omx|exec-omx|review-omx|pipeline|pipeline-omx|claw|ultrawork> <task> [channel_id]"
+        echo "Usage: discord-dispatch.sh <team|architect|executor|reviewer|verifier|arch-omx|exec-omx|review-omx|pipeline|pipeline-omx|ralph|claw|ultrawork> <task> [channel_id]"
         exit 1
         ;;
 esac
