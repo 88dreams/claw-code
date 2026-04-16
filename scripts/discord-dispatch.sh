@@ -10,6 +10,7 @@ MODE="$1"
 TASK="$2"
 CHANNEL="${3:-1492050822681595935}"
 WORKDIR="$HOME/claw-code"
+# Default LLM used for opencode-dispatched roles unless a branch overrides it.
 MODEL="openrouter/google/gemini-3.1-pro-preview"
 
 cd "$WORKDIR" || exit 1
@@ -76,11 +77,29 @@ case "$MODE" in
         ;;
 
     executor)
-        notify "Dispatching \$executor via opencode (Gemini 3.1 Pro)..."
-        OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
-            "You MUST delegate the following task to the Executor sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
+        EXECUTOR_MODE="${EXECUTOR_MODE:-opencode}"
+        if [ "$EXECUTOR_MODE" = "omx" ]; then
+            notify "Dispatching \$executor via OmX (gpt-5.4, Lore commits enabled)..."
+            # Clean stale OmX state to prevent session collisions
+            rm -f "$WORKDIR/.omx/state/team-state.json" 2>/dev/null
+            rm -f "$WORKDIR/.omx/state/native-stop-state.json" 2>/dev/null
+            rm -f "$WORKDIR/.omx/state/session.json" 2>/dev/null
+            rm -f "$WORKDIR/.omx/state/dispatch.json" 2>/dev/null
+            OUTPUT=$(cd "$WORKDIR" && omx exec --dangerously-bypass-approvals-and-sandbox --ephemeral \
+                "$TASK" 2>&1 | tail -400)
+        else
+            notify "Dispatching \$executor via opencode (Gemini 3.1 Pro)..."
+            OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
+                "You MUST delegate the following task to the Executor sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
+        fi
         echo "$OUTPUT"
         send_role_output 1493722957992689744 "Executor Output" "$OUTPUT" || exit 1
+        ;;
+
+    exec-omx)
+        # Direct OmX executor keyword for A/B testing — forces OmX path
+        # regardless of EXECUTOR_MODE env var.
+        EXECUTOR_MODE=omx exec "$0" executor "$TASK" "$CHANNEL"
         ;;
 
     reviewer)
