@@ -10,7 +10,7 @@ MODE="$1"
 TASK="$2"
 CHANNEL="${3:-1492050822681595935}"
 WORKDIR="$HOME/claw-code"
-MODEL="openrouter/qwen/qwen3.6-plus"
+MODEL="openrouter/google/gemini-3.1-pro-preview"
 
 cd "$WORKDIR" || exit 1
 
@@ -32,10 +32,13 @@ send_role_output() {
     local HEADER="**${LABEL}:**"
     # Reserve budget for the header, newline, and truncation marker.
     # Discord limit is 2000; be conservative.
-    local MAX_BODY=1850
+    local MAX_BODY=1950
     local BODY
     if [ ${#FULL} -gt $MAX_BODY ]; then
-        BODY="${FULL:0:$MAX_BODY}"$'\n… [truncated — full output in stdout]'
+        # Keep the TAIL of the output, not the head. The orchestrator's
+        # delegation narration comes first; the sub-agent's actual findings
+        # come last. Front-truncation would drop the valuable part.
+        BODY=$'… [earlier output truncated]\n'"${FULL: -$MAX_BODY}"
     else
         BODY="$FULL"
     fi
@@ -65,32 +68,32 @@ case "$MODE" in
         ;;
 
     architect)
-        notify "Dispatching \$architect via opencode (Qwen 3.6+)..."
+        notify "Dispatching \$architect via opencode (Gemini 3.1 Pro)..."
         OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
-            "You are Architect. Analyze and recommend with file-backed evidence. You are read-only — never edit files. $TASK" 2>&1 | tail -80)
+            "You MUST delegate the following task to the Architect sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
         echo "$OUTPUT"
         send_role_output 1493722920491552889 "Architect Output" "$OUTPUT" || exit 1
         ;;
 
     executor)
-        notify "Dispatching \$executor via opencode (Qwen 3.6+)..."
+        notify "Dispatching \$executor via opencode (Gemini 3.1 Pro)..."
         OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
-            "You are Executor. Implement the requested changes. Verify with tests/diagnostics before claiming completion. $TASK" 2>&1 | tail -80)
+            "You MUST delegate the following task to the Executor sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
         echo "$OUTPUT"
         send_role_output 1493722957992689744 "Executor Output" "$OUTPUT" || exit 1
         ;;
 
     reviewer)
-        notify "Dispatching \$reviewer via opencode (Qwen 3.6+)..."
+        notify "Dispatching \$reviewer via opencode (Gemini 3.1 Pro)..."
         OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
-            "You are Code Reviewer. Review code for spec compliance, security, quality, and performance. Rate issues by severity. Never edit files. $TASK" 2>&1 | tail -80)
+            "You MUST delegate the following task to the Code Reviewer sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
         echo "$OUTPUT"
         send_role_output 1493722988732874763 "Reviewer Output" "$OUTPUT" || exit 1
         ;;
 
     claw)
         notify "Dispatching to claw-code (Claude)..."
-        OUTPUT=$(cd "$WORKDIR" && ./rust/target/debug/claw prompt "$TASK" 2>&1 | tail -80)
+        OUTPUT=$(cd "$WORKDIR" && ./rust/target/debug/claw prompt "$TASK" 2>&1 | tail -400)
         notify "**Claw Output:**
 $OUTPUT"
         echo "$OUTPUT"
@@ -106,10 +109,15 @@ $OUTPUT"
 
         notify "🔗 Pipeline mode: parsing chain..."
 
+        # Strip Discord @mentions (e.g. "@Clawbot", "<@1234567890>") before
+        # segmentation so "$@Clawbot" style tokens don't false-match as a role.
+        CLEANED=$(echo "$TASK" | sed -E 's/<@!?[0-9]+>//g; s/@[A-Za-z0-9_-]+//g')
+
         # Normalize: insert | delimiter before each $role token. Handles optional
-        # leading "then" and leading comma/whitespace. The | is safe because it
-        # can't appear inside a Discord command for shell reasons.
-        NORMALIZED=$(echo "$TASK" | sed -E 's/[[:space:],]*then[[:space:]]+\$(architect|executor|reviewer)\b/|$\1/g; s/[[:space:]]+\$(architect|executor|reviewer)\b/|$\1/g')
+        # leading "then", leading comma/whitespace, and optional whitespace
+        # between the $ and the role name (e.g. "$ reviewer"). The | is safe
+        # because it can't appear inside a Discord command for shell reasons.
+        NORMALIZED=$(echo "$CLEANED" | sed -E 's/[[:space:],]*then[[:space:]]+\$[[:space:]]*(architect|executor|reviewer)\b/|$\1/g; s/[[:space:]]+\$[[:space:]]*(architect|executor|reviewer)\b/|$\1/g')
         # Strip leading | if the task starts with a $role
         NORMALIZED="${NORMALIZED#|}"
 
