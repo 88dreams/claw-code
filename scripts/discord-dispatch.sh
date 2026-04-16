@@ -19,6 +19,15 @@ notify() {
     clawhip send --channel "$CHANNEL" --message "$1" 2>/dev/null || true
 }
 
+# Clear stale OmX session state that can block or confuse new omx exec runs.
+# Called before every OmX dispatch to prevent session collisions.
+clean_omx_state() {
+    rm -f "$WORKDIR/.omx/state/team-state.json" 2>/dev/null
+    rm -f "$WORKDIR/.omx/state/native-stop-state.json" 2>/dev/null
+    rm -f "$WORKDIR/.omx/state/session.json" 2>/dev/null
+    rm -f "$WORKDIR/.omx/state/dispatch.json" 2>/dev/null
+}
+
 # Send long agent output to a role channel. Discord caps messages at 2000 chars,
 # so truncate with a marker. Full output still goes to stdout for programmatic
 # callers. Returns non-zero if the clawhip send fails, so callers (including
@@ -31,9 +40,9 @@ send_role_output() {
     local LABEL="$2"
     local FULL="$3"
     local HEADER="**${LABEL}:**"
-    # Reserve budget for the header, newline, and truncation marker.
-    # Discord limit is 2000; be conservative.
-    local MAX_BODY=1950
+    # Discord limit is 2000. Budget: header (~30), truncation marker (~35),
+    # newlines (~5). Leaves ~1900 for actual content. Round down for safety.
+    local MAX_BODY=1900
     local BODY
     if [ ${#FULL} -gt $MAX_BODY ]; then
         # Keep the TAIL of the output, not the head. The orchestrator's
@@ -69,9 +78,17 @@ case "$MODE" in
         ;;
 
     architect)
-        notify "Dispatching \$architect via opencode (Gemini 3.1 Pro)..."
-        OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
-            "You MUST delegate the following task to the Architect sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
+        ARCHITECT_MODE="${ARCHITECT_MODE:-opencode}"
+        if [ "$ARCHITECT_MODE" = "omx" ]; then
+            notify "Dispatching \$architect via OmX (gpt-5.4, read-only analysis)..."
+            clean_omx_state
+            OUTPUT=$(cd "$WORKDIR" && omx exec --dangerously-bypass-approvals-and-sandbox --ephemeral \
+                "You are Architect. You are READ-ONLY — never edit files. Analyze with file-backed evidence, cite file:line references, identify root causes, and provide concrete recommendations with tradeoffs. Task: $TASK" 2>&1 | tail -400)
+        else
+            notify "Dispatching \$architect via opencode (Gemini 3.1 Pro)..."
+            OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
+                "You MUST delegate the following task to the Architect sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
+        fi
         echo "$OUTPUT"
         send_role_output 1493722920491552889 "Architect Output" "$OUTPUT" || exit 1
         ;;
@@ -80,11 +97,7 @@ case "$MODE" in
         EXECUTOR_MODE="${EXECUTOR_MODE:-opencode}"
         if [ "$EXECUTOR_MODE" = "omx" ]; then
             notify "Dispatching \$executor via OmX (gpt-5.4, Lore commits enabled)..."
-            # Clean stale OmX state to prevent session collisions
-            rm -f "$WORKDIR/.omx/state/team-state.json" 2>/dev/null
-            rm -f "$WORKDIR/.omx/state/native-stop-state.json" 2>/dev/null
-            rm -f "$WORKDIR/.omx/state/session.json" 2>/dev/null
-            rm -f "$WORKDIR/.omx/state/dispatch.json" 2>/dev/null
+            clean_omx_state
             OUTPUT=$(cd "$WORKDIR" && omx exec --dangerously-bypass-approvals-and-sandbox --ephemeral \
                 "$TASK" 2>&1 | tail -400)
         else
@@ -96,16 +109,33 @@ case "$MODE" in
         send_role_output 1493722957992689744 "Executor Output" "$OUTPUT" || exit 1
         ;;
 
+    arch-omx)
+        # Direct OmX architect keyword for A/B testing.
+        ARCHITECT_MODE=omx exec "$0" architect "$TASK" "$CHANNEL"
+        ;;
+
     exec-omx)
-        # Direct OmX executor keyword for A/B testing — forces OmX path
-        # regardless of EXECUTOR_MODE env var.
+        # Direct OmX executor keyword for A/B testing.
         EXECUTOR_MODE=omx exec "$0" executor "$TASK" "$CHANNEL"
         ;;
 
+    review-omx)
+        # Direct OmX reviewer keyword for A/B testing.
+        REVIEWER_MODE=omx exec "$0" reviewer "$TASK" "$CHANNEL"
+        ;;
+
     reviewer)
-        notify "Dispatching \$reviewer via opencode (Gemini 3.1 Pro)..."
-        OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
-            "You MUST delegate the following task to the Code Reviewer sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
+        REVIEWER_MODE="${REVIEWER_MODE:-opencode}"
+        if [ "$REVIEWER_MODE" = "omx" ]; then
+            notify "Dispatching \$reviewer via OmX (gpt-5.4, two-stage review)..."
+            clean_omx_state
+            OUTPUT=$(cd "$WORKDIR" && omx exec --dangerously-bypass-approvals-and-sandbox --ephemeral \
+                "You are Code Reviewer. Perform a two-stage review: Stage 1 (spec compliance) then Stage 2 (code quality with lsp_diagnostics). Rate each issue by severity (CRITICAL/HIGH/MEDIUM/LOW). Your response MUST end with a single verdict line in exactly this format: Verdict: APPROVE or Verdict: REQUEST CHANGES or Verdict: COMMENT — this line is machine-parsed by the pipeline gate. Task: $TASK" 2>&1 | tail -400)
+        else
+            notify "Dispatching \$reviewer via opencode (Gemini 3.1 Pro)..."
+            OUTPUT=$(opencode run -m "$MODEL" --dir "$WORKDIR" --dangerously-skip-permissions \
+                "You MUST delegate the following task to the Code Reviewer sub-agent SYNCHRONOUSLY — do NOT launch it in the background. Wait for the sub-agent to finish, then include its COMPLETE output in your final response. Do not summarize or paraphrase — paste the sub-agent's full text. Do not respond until the sub-agent has returned. Task: $TASK" 2>&1 | tail -400)
+        fi
         echo "$OUTPUT"
         send_role_output 1493722988732874763 "Reviewer Output" "$OUTPUT" || exit 1
         ;;
@@ -175,6 +205,13 @@ $OUTPUT"
         echo "pipeline_steps=$STEP_COUNT pipeline_failures=$FAILED_COUNT"
         ;;
 
+    pipeline-omx)
+        # All-OmX pipeline: forces all three roles through OmX regardless
+        # of individual ARCHITECT_MODE/EXECUTOR_MODE/REVIEWER_MODE vars.
+        export ARCHITECT_MODE=omx EXECUTOR_MODE=omx REVIEWER_MODE=omx
+        exec "$0" pipeline "$TASK" "$CHANNEL"
+        ;;
+
     ultrawork)
         SESSION_NAME="ulw-$(date +%s)"
         notify "Spawning ultrawork session: $SESSION_NAME"
@@ -187,7 +224,7 @@ $OUTPUT"
         ;;
 
     *)
-        echo "Usage: discord-dispatch.sh <team|architect|executor|reviewer|pipeline|claw|ultrawork> <task> [channel_id]"
+        echo "Usage: discord-dispatch.sh <team|architect|executor|reviewer|arch-omx|exec-omx|review-omx|pipeline|pipeline-omx|claw|ultrawork> <task> [channel_id]"
         exit 1
         ;;
 esac
